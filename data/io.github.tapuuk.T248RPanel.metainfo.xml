@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.tapuuk.T248RPanel</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT AND OFL-1.1 AND Apache-2.0</project_license>
+  <name>My Linux T248R Panel</name>
+  <summary>Set up and tune the Thrustmaster T248R racing wheel</summary>
+  <developer id="io.github.tapuuk">
+    <name>Tapuuk</name>
+  </developer>
+  <description>
+    <p>
+      My Linux T248R Panel gets a Thrustmaster T248R racing wheel working on Linux, force feedback included,
+      and then lets you test and tune it.
+    </p>
+    <ul>
+      <li>Installs the hid-tmff2 force feedback driver through DKMS, so it keeps working after kernel updates</li>
+      <li>Switches the wheel from PlayStation mode to PC mode for you</li>
+      <li>Shows steering, pedals, buttons, the D-pad and the encoders live</li>
+      <li>Sets rotation range, strength, spring, damper and friction</li>
+      <li>Tests the TH8A and TH8S shifters over USB</li>
+    </ul>
+    <p>
+      Setting up the driver asks for your password once. This app is not made by or affiliated with Thrustmaster.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.tapuuk.T248RPanel.desktop</launchable>
+  <url type="homepage">https://github.com/Tapuuk/my-linux-t248r-panel</url>
+  <url type="bugtracker">https://github.com/Tapuuk/my-linux-t248r-panel/issues</url>
+  <url type="vcs-browser">https://github.com/Tapuuk/my-linux-t248r-panel</url>
+  <categories>
+    <category>Settings</category>
+    <category>HardwareSettings</category>
+    <category>Game</category>
+  </categories>
+  <keywords>
+    <keyword>Thrustmaster</keyword>
+    <keyword>T248R</keyword>
+    <keyword>racing wheel</keyword>
+    <keyword>force feedback</keyword>
+    <keyword>sim racing</keyword>
+  </keywords>
+  <provides>
+    <binary>my-linux-t248r-panel</binary>
+    <modalias>usb:v044FpB696d*</modalias>
+    <modalias>usb:v044FpB66Dd*</modalias>
+    <modalias>usb:v044FpB69Dd*</modalias>
+    <modalias>usb:v044FpB660d*</modalias>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-25">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Tapuuk</vendor>
+  <vendor_url>https://github.com/Tapuuk/my-linux-t248r-panel</vendor_url>
+  <icon_name>io.github.tapuuk.T248RPanel</icon_name>
+
+  <action id="io.github.tapuuk.T248RPanel.helper">
+    <description>Set up the Thrustmaster T248R racing wheel</description>
+    <message>Authentication is required to install the wheel driver and change system settings for your racing wheel.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/my-linux-t248r-panel/t248r-panel-helper</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,21 @@
+# Maintainer: Tapuuk <https://github.com/Tapuuk>
+# Built from the tarball made by `make dist` (or `make arch`), so a private repo can be built in CI.
+
+pkgname=my-linux-t248r-panel
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Set up, test and tune the Thrustmaster T248R racing wheel'
+arch=('any')
+url='https://github.com/Tapuuk/my-linux-t248r-panel'
+license=('MIT AND OFL-1.1 AND Apache-2.0')
+depends=('python' 'pyside6' 'python-evdev' 'polkit' 'git')
+optdepends=('qt6-svg: window icon')
+source=("$pkgname-$pkgver.tar.gz")
+# Local tarball from the same tree, regenerated for every build.
+sha256sums=('SKIP')
+
+package() {
+  cd "$pkgname-$pkgver"
+  make DESTDIR="$pkgdir" PREFIX=/usr install
+  python -m compileall -q -f -d /usr/lib/$pkgname "$pkgdir/usr/lib/$pkgname"
+}

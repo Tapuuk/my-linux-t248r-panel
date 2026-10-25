@@ -1,0 +1,42 @@
+Anim 1.0 Anim.qml
+singleton Appearance 1.0 Appearance.qml
+ButtonMap 1.0 ButtonMap.qml
+CAnim 1.0 CAnim.qml
+Card 1.0 Card.qml
+CardTitle 1.0 CardTitle.qml
+Chip 1.0 Chip.qml
+singleton Clipboard 1.0 Clipboard.qml
+singleton Colours 1.0 Colours.qml
+CommandBox 1.0 CommandBox.qml
+ConfirmDialog 1.0 ConfirmDialog.qml
+ConnectedRect 1.0 ConnectedRect.qml
+FocusRing 1.0 FocusRing.qml
+HGate 1.0 HGate.qml
+HelpCard 1.0 HelpCard.qml
+HintCard 1.0 HintCard.qml
+Icon 1.0 Icon.qml
+IconButton 1.0 IconButton.qml
+singleton Icons 1.0 Icons.qml
+ListTile 1.0 ListTile.qml
+LoadingIndicator 1.0 LoadingIndicator.qml
+MapButton 1.0 MapButton.qml
+NavRail 1.0 NavRail.qml
+Page 1.0 Page.qml
+PedalBar 1.0 PedalBar.qml
+PolarShape 1.0 PolarShape.qml
+PsSymbol 1.0 PsSymbol.qml
+ScrollBar 1.0 ScrollBar.qml
+SectionHeader 1.0 SectionHeader.qml
+SliderRow 1.0 SliderRow.qml
+Snackbar 1.0 Snackbar.qml
+StateIcon 1.0 StateIcon.qml
+StateLayer 1.0 StateLayer.qml
+SteeringWheel 1.0 SteeringWheel.qml
+StepList 1.0 StepList.qml
+StyledRect 1.0 StyledRect.qml
+StyledSlider 1.0 StyledSlider.qml
+StyledText 1.0 StyledText.qml
+TextButton 1.0 TextButton.qml
+Tip 1.0 Tip.qml
+ToggleSwitch 1.0 ToggleSwitch.qml
+WheelStatus 1.0 WheelStatus.qml

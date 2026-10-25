@@ -1,0 +1,20 @@
+Package: my-linux-t248r-panel
+Version: @VERSION@
+Architecture: all
+Maintainer: Tapuuk <tapuuk@users.noreply.github.com>
+Installed-Size: @SIZE@
+Section: utils
+Priority: optional
+Homepage: https://github.com/Tapuuk/my-linux-t248r-panel
+Depends: python3 (>= 3.10), python3-evdev, python3-venv, pkexec | policykit-1, git
+Recommends: python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtqml, python3-pyside6.qtquick, python3-pyside6.qtquickcontrols2, qml6-module-qtqml, qml6-module-qtqml-workerscript, qml6-module-qtquick, qml6-module-qtquick-controls, qml6-module-qtquick-templates, qml6-module-qtquick-layouts, qml6-module-qtquick-shapes, qml6-module-qtquick-effects, qml6-module-qtquick-window, qt6-svg-plugins, libxcb-cursor0, libnotify-bin
+Suggests: zenity | kdialog
+Description: Set up, test and tune the Thrustmaster T248R racing wheel
+ My Linux T248R Panel gets a Thrustmaster T248R racing wheel working on
+ Linux, force feedback included, and then lets you test and tune it. It
+ installs the hid-tmff2 driver through DKMS, switches the wheel to PC mode,
+ shows steering, pedals and buttons live, and tests TH8A/TH8S shifters.
+ .
+ Debian 13 and Ubuntu 25.04 or newer provide PySide6 as packages. On older
+ releases such as Debian 12 and Ubuntu 24.04 the app downloads a pinned
+ PySide6 into ~/.local/share/my-linux-t248r-panel the first time it starts.

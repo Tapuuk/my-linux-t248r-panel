@@ -1,0 +1,1298 @@
+#!/usr/bin/python3
+"""Root helper for My Linux T248R Panel. Run through pkexec; see usage() for commands."""
+import errno
+import glob
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+HELPER = os.path.realpath(__file__)
+
+DRIVER_URL = "https://github.com/Kimplul/hid-tmff2.git"
+DRIVER_COMMIT = "d890a93105a0aa52028ac49282fa1b579e12566e"
+# Bump with any change to how the driver is built, so existing installs get replaced.
+REVISION = "r2"
+BUILD_ID = f"{DRIVER_COMMIT}+{REVISION}"
+DKMS_NAME = "hid-tmff2"
+DKMS_VERSION = f"0.83.{DRIVER_COMMIT[:7]}.{REVISION}"
+MODULE = "hid-tmff-new"
+MODULE_SYS = "/sys/module/hid_tmff_new"
+HID_DRIVER = "tmff2"
+
+WORK_DIR = "/var/tmp/my-linux-t248r-panel"
+RULES_FILE = "/etc/udev/rules.d/70-my-linux-t248r-panel.rules"
+OPTIONS_FILE = "/etc/modprobe.d/my-linux-t248r-panel.conf"
+MARKER = ".my-linux-t248r-panel"
+PLAIN_SUBDIR = "updates/my-linux-t248r-panel"
+MOK_PUB = "/var/lib/dkms/mok.pub"
+
+VENDOR = "044f"
+PC_PID = "b696"
+PS_PIDS = ("b66d", "b69d")
+T248R_BCD = "0249"
+TUNABLES = ("range", "gain", "spring_level", "damper_level", "friction_level")
+MODULE_PARAMS = ("open_mode", "timer_msecs")
+
+# Allowed option keys, in the order they are written, with inclusive ranges.
+OPTION_RANGES = {
+    "range": (40, 900),
+    "gain": (0, 65535),
+    "spring_level": (0, 100),
+    "damper_level": (0, 100),
+    "friction_level": (0, 100),
+    "open_mode": (0, 1),
+    "timer_msecs": (2, 50),
+}
+# hid-tmff2's own module defaults.
+OPTION_DEFAULTS = {"range": 900, "gain": 40000, "spring_level": 30, "damper_level": 30,
+                   "friction_level": 30, "open_mode": 1, "timer_msecs": 8}
+
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+DRY = False
+DRY_HAS_DKMS = False  # dry-run: pretend the tools step installed dkms
+DRY_NEW_DRIVER = False  # dry-run: pretend the driver step installed a new build
+KVER = os.uname().release
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- output
+
+def _out(line):
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The app went away. Keep working so the system is not left half done.
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+
+
+def _one_line(text):
+    return " ".join(str(text).split())
+
+
+def log(text=""):
+    for line in str(text).splitlines() or [""]:
+        _out(" " + line if line.startswith("@@") else line)
+
+
+def step(sid, state, text):
+    _out(f"@@step {sid} {state} {_one_line(text)}")
+
+
+def hint(code, text):
+    _out(f"@@hint {code} {_one_line(text)}")
+
+
+def dry(text):
+    log("[dry-run] " + text)
+
+
+# ---------------------------------------------------------------- commands and files
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _env(extra=None):
+    env = dict(os.environ)
+    env["PATH"] = SAFE_PATH + (":" + os.environ.get("PATH", "") if DRY else "")
+    env.pop("PYTHONPATH", None)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def which(name):
+    return shutil.which(name, path=_env()["PATH"])
+
+
+def query(cmd, env=None):
+    """Run a read-only command and return (exit code, output). Runs in dry-run too."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           stdin=subprocess.DEVNULL, env=_env(env), text=True, errors="replace")
+        return p.returncode, p.stdout
+    except OSError:
+        return 127, ""
+
+
+def run(cmd, env=None, cwd=None, log_path=None, quiet=False):
+    """Run a command that changes the system, streaming its output as log lines.
+
+    Returns (exit code, output lines). In dry-run it only prints the command.
+    """
+    shown = shlex.join(cmd)
+    if cwd:
+        shown = f"(in {cwd}) {shown}"
+    if DRY:
+        dry("run: " + shown)
+        return 0, []
+    if not quiet:
+        log("$ " + shown)
+    lines = []
+    logf = open(log_path, "w") if log_path else None
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, env=_env(env), cwd=cwd)
+    except OSError as e:
+        if logf:
+            logf.close()
+        log(f"Could not run {cmd[0]}: {e.strerror}")
+        return 127, []
+    for raw in p.stdout:
+        text = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if logf:
+            logf.write(text + "\n")
+        text = _ANSI.sub("", text.split("\r")[-1]).rstrip()
+        if not text:
+            continue
+        lines.append(text)
+        if not quiet:
+            log(text)
+    rc = p.wait()
+    if logf:
+        logf.close()
+    return rc, lines
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write_file(path, content, mode=0o644):
+    if DRY:
+        dry(f"write {path} (mode {mode:o}):")
+        for line in content.rstrip("\n").splitlines():
+            dry("  | " + line)
+        return
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o755, exist_ok=True)
+    tmp = os.path.join(d, "." + os.path.basename(path) + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def write_sysfs(path, value):
+    if DRY:
+        dry(f"write '{value}' to {path}")
+        return
+    with open(path, "w") as f:
+        f.write(str(value))
+
+
+def remove_path(path):
+    """Remove a file, symlink or directory tree. Never follows a symlink."""
+    if not os.path.lexists(path):
+        return False
+    if DRY:
+        dry("remove " + path)
+        return True
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+    return True
+
+
+def copy_tree(src, dst):
+    if DRY:
+        dry(f"copy {src} to {dst} (without .git)")
+        return
+    shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+
+
+# ---------------------------------------------------------------- system facts
+
+def os_release():
+    info = {}
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        text = read(path)
+        if text is None:
+            continue
+        for line in text.splitlines():
+            m = re.match(r"^([A-Z_]+)=(.*)$", line.strip())
+            if m:
+                v = m.group(2).strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                info[m.group(1)] = v
+        break
+    return info
+
+
+FAMILY_IDS = {
+    "arch": {"arch", "archarm", "cachyos", "endeavouros", "manjaro", "manjaro-arm", "garuda",
+             "artix", "arcolinux", "rebornos", "biglinux", "parabola", "steamos"},
+    "debian": {"debian", "ubuntu", "linuxmint", "pop", "zorin", "elementary", "neon", "kali",
+               "raspbian", "pureos", "mx", "deepin", "tuxedo", "lmde"},
+    "fedora": {"fedora", "nobara", "ultramarine", "rhel", "centos", "rocky", "almalinux"},
+    "suse": {"opensuse", "opensuse-tumbleweed", "opensuse-leap", "opensuse-slowroll", "suse",
+             "sles"},
+}
+
+
+def detect_family(info=None):
+    info = info if info is not None else os_release()
+    ids = [info.get("ID", "").lower()] + info.get("ID_LIKE", "").lower().split()
+    for token in ids:
+        for fam, names in FAMILY_IDS.items():
+            if token in names:
+                return fam
+    for token in ids:
+        if token.startswith("opensuse"):
+            return "suse"
+    return "unknown"
+
+
+def _readonly(path):
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
+
+
+def detect_immutable(info=None):
+    """Returns a short reason when the system can't take new packages, else None."""
+    info = info if info is not None else os_release()
+    os_id = info.get("ID", "").lower()
+    like = info.get("ID_LIKE", "").lower().split()
+    name = info.get("NAME", os_id or "This system")
+    if os.path.exists("/run/ostree-booted"):
+        return f"{name} is an image-based system (ostree)"
+    if os_id == "steamos":
+        return "SteamOS resets system changes on every update"
+    if os_id in ("nixos",):
+        return "NixOS is set up through its configuration, not by installing packages"
+    if any(x in ("opensuse-microos", "microos") or "aeon" in x or "kalpa" in x
+           for x in [os_id] + like) or os.path.exists("/usr/sbin/transactional-update"):
+        return f"{name} uses transactional updates"
+    if os.path.exists("/usr/bin/abroot"):
+        return f"{name} is an image-based system (ABRoot)"
+    if _readonly("/usr") or _readonly("/"):
+        return "the system folders are read-only"
+    return None
+
+
+def build_dir():
+    return f"/lib/modules/{KVER}/build"
+
+
+def kernel_is_clang():
+    cfg = read(f"{build_dir()}/.config", "")
+    if "CONFIG_CC_IS_CLANG=y" in cfg:
+        return True
+    return "clang" in (read("/proc/version", "") or "")
+
+
+def sig_enforced():
+    """True when the kernel refuses modules it can't verify."""
+    if read("/sys/module/module/parameters/sig_enforce") == "Y":
+        return True
+    lock = read("/sys/kernel/security/lockdown")
+    return bool(lock) and "[none]" not in lock
+
+
+def secureboot_hint():
+    if os.path.exists(MOK_PUB):
+        hint("secureboot", "Your kernel only loads signed drivers. DKMS signed this one with its own key, "
+             "which your PC does not trust yet. Run: sudo mokutil --import /var/lib/dkms/mok.pub "
+             "and choose a one-time password. Reboot, pick Enroll MOK on the blue screen, "
+             "enter that password, then run setup again.")
+    else:
+        hint("secureboot", "Your kernel only loads signed drivers and this one is not signed with a key "
+             "your PC trusts. Sign it with your own Secure Boot key (for example with sbctl or a MOK), "
+             "or turn off Secure Boot in your firmware settings, then run setup again.")
+
+
+def mok_enrolled():
+    if not which("mokutil") or not os.path.exists(MOK_PUB):
+        return None
+    _, out = query(["mokutil", "--test-key", MOK_PUB])
+    if "already enrolled" in out:
+        return True
+    if "not enrolled" in out:
+        return False
+    return None
+
+
+# ---------------------------------------------------------------- devices
+
+def usb_devices():
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        if read(f"{d}/idVendor") == VENDOR and os.path.exists(f"{d}/devnum"):
+            yield d
+
+
+def wheels_in_ps_mode():
+    return [d for d in usb_devices()
+            if read(f"{d}/idProduct") in PS_PIDS and read(f"{d}/bcdDevice") == T248R_BCD]
+
+
+def pc_hid_devices():
+    return sorted(glob.glob(f"/sys/bus/hid/devices/0003:044F:{PC_PID.upper()}.*"))
+
+
+def driver_of(path):
+    link = f"{path}/driver"
+    return os.path.basename(os.path.realpath(link)) if os.path.exists(link) else None
+
+
+def wait_for(cond, seconds, interval=0.25):
+    end = time.monotonic() + seconds
+    while True:
+        if cond():
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(interval)
+
+
+# ---------------------------------------------------------------- package managers
+
+APT_ENV = {"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_SUSPEND": "1"}
+_apt_updated = False
+
+NET_PATTERNS = ("could not resolve", "temporary failure resolving", "failed retrieving file",
+                "failed to download", "curl error", "cannot download", "network is unreachable",
+                "connection timed out", "could not connect", "failed to synchronize")
+
+
+def _pacman_lock_wait():
+    lock = "/var/lib/pacman/db.lck"
+    if DRY or not os.path.exists(lock):
+        return
+    log("Another package manager is running. Waiting for it to finish...")
+    if not wait_for(lambda: not os.path.exists(lock), 60, 1):
+        raise Fail("pacman is locked (/var/lib/pacman/db.lck). Close any other package manager and "
+                   "try again. If nothing else is running, a crash left the lock behind: delete that "
+                   "file, then retry.")
+
+
+def _pm_failure(family, rc, lines):
+    text = "\n".join(lines[-60:]).lower()
+    if any(p in text for p in NET_PATTERNS):
+        hint("no-network", "Could not download packages. Check your internet connection and try again.")
+        return "Downloading packages failed. Check your internet connection."
+    if family == "arch":
+        if "unable to lock database" in text:
+            return ("pacman is locked (/var/lib/pacman/db.lck). Close any other package manager and "
+                    "try again.")
+        if "target not found" in text:
+            return "pacman could not find a package. Update your system (pacman -Syu), restart, then try again."
+    if family == "debian":
+        if "could not get lock" in text or "unable to acquire the dpkg frontend lock" in text \
+                or "unable to lock the administration directory" in text:
+            return "Another program is installing software (apt is locked). Wait for it to finish, then try again."
+        if "dpkg was interrupted" in text:
+            return "A previous install was interrupted. Run 'sudo dpkg --configure -a', then try again."
+        if "unable to locate package" in text:
+            return "apt could not find a package. Update your system, restart, then try again."
+    if family == "suse" and "system management is locked" in text:
+        return "Another program is using zypper. Wait for it to finish, then try again."
+    if family == "fedora" and "no match for argument" in text:
+        return "dnf could not find a package. Update your system, restart, then try again."
+    return f"The package manager failed (exit code {rc}). The log above has the details."
+
+
+def pm_install(family, pkgs):
+    """Install packages non-interactively. Returns None on success, else an error message."""
+    global _apt_updated
+    env = None
+    if family == "arch":
+        _pacman_lock_wait()
+        cmd = ["pacman", "-S", "--needed", "--noconfirm"] + pkgs
+    elif family == "debian":
+        env = APT_ENV
+        if not _apt_updated:
+            rc, lines = run(["apt-get", "update"], env=env)
+            if rc != 0:
+                return _pm_failure(family, rc, lines)
+            _apt_updated = True
+        cmd = ["apt-get", "install", "-y", "-o", "DPkg::Lock::Timeout=120",
+               "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"] + pkgs
+    elif family == "fedora":
+        cmd = ["dnf", "install", "-y"] + pkgs
+    elif family == "suse":
+        env = {"ZYPP_LOCK_TIMEOUT": "60"}
+        cmd = ["zypper", "--non-interactive", "install"] + pkgs
+    else:
+        return "No package manager for this system."
+    rc, lines = run(cmd, env=env)
+    return None if rc == 0 else _pm_failure(family, rc, lines)
+
+
+def headers_package(family):
+    """Returns (package names to try in order) for the running kernel's headers."""
+    if family == "arch":
+        moddir = f"/usr/lib/modules/{KVER}"
+        if not os.path.isdir(moddir):
+            hint("reboot", "Your kernel was updated since the last restart. Restart your computer, "
+                 "then run setup again.")
+            raise Fail("The running kernel's files are gone because the kernel was updated. Restart first.")
+        base = read(f"{moddir}/pkgbase")
+        if not base or not re.fullmatch(r"[a-z0-9][a-z0-9._+-]*", base):
+            raise Fail(f"Could not tell which kernel package you run ({KVER}). "
+                       "Install its headers package yourself, then try again.")
+        return [base + "-headers"]
+    if family == "debian":
+        return ["linux-headers-" + KVER]
+    if family == "fedora":
+        return ["kernel-devel-" + KVER, "kernel-devel"]
+    if family == "suse":
+        m = re.search(r"-([a-z0-9]+)$", KVER)
+        flavor = m.group(1) if m and not m.group(1).isdigit() else "default"
+        return [f"kernel-{flavor}-devel"]
+    return []
+
+
+# ---------------------------------------------------------------- driver state
+
+_DKMS_LINE = re.compile(
+    r"^([^,/\s]+)[/,]\s*([^,:\s]+)(?:,\s*([^,:\s]+))?(?:,\s*([^,:\s]+))?:\s*([a-z-]+)", re.I)
+
+
+def dkms_status():
+    """List of (version, kernel or None, state) for hid-tmff2 entries."""
+    if not which("dkms"):
+        return []
+    _, out = query(["dkms", "status", "-m", DKMS_NAME], env={"LC_ALL": "C"})
+    res = []
+    for line in out.splitlines():
+        m = _DKMS_LINE.match(line.strip())
+        if m and m.group(1) == DKMS_NAME:
+            res.append((m.group(2), m.group(3), m.group(5).lower()))
+    return res
+
+
+def src_dir(ver):
+    return f"/usr/src/{DKMS_NAME}-{ver}"
+
+
+def is_ours(ver):
+    return os.path.exists(os.path.join(src_dir(ver), MARKER))
+
+
+def our_dkms_versions():
+    vers = {os.path.basename(p)[len(DKMS_NAME) + 1:]
+            for p in glob.glob(f"/usr/src/{DKMS_NAME}-*") if os.path.exists(os.path.join(p, MARKER))}
+    return sorted(vers)
+
+
+def module_path():
+    rc, out = query(["modinfo", "-k", KVER, "-n", MODULE])
+    out = out.strip()
+    return out if rc == 0 and out.startswith("/") else None
+
+
+def plain_dir(kver=None):
+    return f"/lib/modules/{kver or KVER}/{PLAIN_SUBDIR}"
+
+
+def foreign_driver():
+    """Describe an hid-tmff2 for the running kernel that this app did not install, or None."""
+    installed = [ver for ver, kern, state in dkms_status() if kern == KVER and state == "installed"]
+    for ver in installed:
+        if not is_ours(ver):
+            return f"DKMS module {DKMS_NAME} {ver}"
+    if installed:
+        return None
+    path = module_path()
+    if not path:
+        return None
+    real = os.path.realpath(path)
+    if real.startswith(os.path.realpath(plain_dir()) + "/") or "/updates/dkms/" in real:
+        return None
+    return path
+
+
+# ---------------------------------------------------------------- steps
+
+def check_immutable_for_install():
+    reason = detect_immutable()
+    if not reason:
+        return False
+    if module_path() or os.path.isdir(MODULE_SYS):
+        return True
+    hint("immutable", f"This app can't install the driver here: {reason}. "
+         "Use a system image that already includes hid-tmff2, or install it the way your system expects.")
+    raise Fail("The system is read-only, so the driver can't be installed.")
+
+
+def do_tools():
+    global DRY_HAS_DKMS
+    family = detect_family()
+    if check_immutable_for_install():
+        return "skipped", "The driver is already part of your system. Nothing to install."
+
+    missing = [t for t in ("git", "make", "gcc") if not which(t)]
+    need_dkms = not which("dkms")
+    need_headers = not os.path.isdir(build_dir())
+    clang = kernel_is_clang()
+    need_clang = clang and not (which("clang") and which("ld.lld"))
+
+    if not (missing or need_dkms or need_headers or need_clang):
+        return "skipped", "Build tools and kernel headers are already installed."
+
+    if family == "unknown":
+        if not (missing or need_headers or need_clang):
+            log("DKMS is not installed. The driver will be built without it.")
+            return "skipped", "Build tools are already installed."
+        hint("unsupported", "Your distro isn't one this app knows. Install git, make, gcc, dkms and the "
+             f"headers for kernel {KVER} yourself, then run setup again.")
+        raise Fail("Can't install build tools on this distro automatically.")
+
+    pkgs = []
+    if family == "debian":
+        if "git" in missing:
+            pkgs.append("git")
+        if "make" in missing or "gcc" in missing:
+            pkgs.append("build-essential")
+    else:
+        pkgs += missing
+    if need_clang:
+        pkgs += ["clang", "llvm", "lld"]
+
+    if need_headers:
+        candidates = headers_package(family)
+        log("Installing headers for kernel " + KVER)
+        err = None
+        for i, pkg in enumerate(candidates):
+            err = pm_install(family, pkgs + [pkg])
+            if err is None:
+                break
+            if i + 1 < len(candidates):
+                log(f"{pkg} is not available, trying {candidates[i + 1]}")
+        if err:
+            raise Fail(err)
+        pkgs = []
+    if pkgs:
+        err = pm_install(family, pkgs)
+        if err:
+            raise Fail(err)
+
+    if need_dkms:
+        err = pm_install(family, ["dkms"])
+        if err:
+            log("DKMS is not available here. The driver will be built without it, "
+                "so it has to be built again after each kernel update.")
+        elif DRY:
+            DRY_HAS_DKMS = True
+
+    if DRY:
+        return "done", "Build tools would be installed (dry run)."
+    still = [t for t in ("git", "make", "gcc") if not which(t)]
+    if still:
+        raise Fail("These tools are still missing: " + ", ".join(still))
+    if not os.path.isdir(build_dir()):
+        hint("reboot", "The installed kernel headers don't match the running kernel. "
+             "Update your system, restart your computer, then run setup again.")
+        raise Fail(f"Headers for kernel {KVER} are still missing ({build_dir()}).")
+    return "done", "Build tools and kernel headers are installed."
+
+
+def has_dkms():
+    return bool(which("dkms")) or (DRY and DRY_HAS_DKMS)
+
+
+def prepare_work_dir():
+    # /var/tmp is world-writable, so never trust what is already there.
+    if os.path.lexists(WORK_DIR):
+        remove_path(WORK_DIR)
+    if DRY:
+        dry(f"create {WORK_DIR} (mode 700)")
+        return
+    try:
+        os.mkdir(WORK_DIR, 0o700)
+    except OSError as e:
+        raise Fail(f"Could not create the work folder {WORK_DIR}: {e.strerror}")
+    st = os.lstat(WORK_DIR)
+    if st.st_uid != 0 or not os.path.isdir(WORK_DIR) or os.path.islink(WORK_DIR):
+        raise Fail(f"Could not create a safe work folder at {WORK_DIR}.")
+
+
+def fetch_driver():
+    """Clone the pinned commit. Returns the clone path."""
+    prepare_work_dir()
+    dest = os.path.join(WORK_DIR, DKMS_NAME)
+    genv = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "HOME": WORK_DIR, "LC_ALL": "C"}
+    log("Downloading hid-tmff2 from GitHub")
+    rc, lines = run(["git", "clone", "--recurse-submodules", DRIVER_URL, dest], env=genv)
+    if rc != 0:
+        text = "\n".join(lines).lower()
+        if any(p in text for p in ("could not resolve", "unable to access", "failed to connect",
+                                   "network is unreachable", "timed out")):
+            hint("no-network", "Could not reach GitHub. Check your internet connection and try again.")
+            raise Fail("Downloading the driver failed. Check your internet connection.")
+        raise Fail("Downloading the driver failed. The log above has the details.")
+    for cmd in (["git", "-C", dest, "checkout", "-q", "--detach", DRIVER_COMMIT],
+                ["git", "-C", dest, "submodule", "update", "--init", "--recursive"]):
+        rc, _ = run(cmd, env=genv)
+        if rc != 0:
+            raise Fail("Could not check out the tested driver version.")
+    if DRY:
+        dry(f"check that git rev-parse HEAD is {DRIVER_COMMIT}")
+    else:
+        rc, head = query(["git", "-C", dest, "rev-parse", "HEAD"], env=genv)
+        if rc != 0 or head.strip() != DRIVER_COMMIT:
+            raise Fail(f"The downloaded driver is not the tested version (got {head.strip() or 'nothing'}).")
+        _, sub = query(["git", "-C", dest, "submodule", "status", "--recursive"], env=genv)
+        if not sub.strip() or any(l[:1] in "-+U" for l in sub.splitlines() if l):
+            raise Fail("The driver's hid-tminit part did not download correctly.")
+        log("Got hid-tmff2 at commit " + DRIVER_COMMIT[:7])
+    return dest
+
+
+DKMS_CONF = f"""# Based on hid-tmff2's dkms/dkms.conf at commit {DRIVER_COMMIT[:7]}.
+# Written by My Linux T248R Panel, which also removes it.
+PACKAGE_NAME="{DKMS_NAME}"
+PACKAGE_VERSION="{DKMS_VERSION}"
+AUTOINSTALL="yes"
+
+# Quoting 'make' stops DKMS adding KERNELRELEASE, which would confuse the Makefile.
+MAKE[0]="'make' KDIR=\\"$kernel_source_dir\\""
+CLEAN[0]=true
+
+BUILT_MODULE_LOCATION[0]="deps/hid-tminit/"
+BUILT_MODULE_LOCATION[1]="deps/hid-tminit/"
+BUILT_MODULE_NAME[0]="hid-tminit-new"
+BUILT_MODULE_NAME[1]="usb-tminit-new"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/hid"
+DEST_MODULE_LOCATION[1]="/kernel/drivers/usb"
+BUILT_MODULE_NAME[2]="hid-tmff-new"
+DEST_MODULE_LOCATION[2]="/kernel/drivers/hid"
+"""
+
+
+def dkms_make_log():
+    logs = glob.glob(f"/var/lib/dkms/{DKMS_NAME}/{DKMS_VERSION}/build/make.log")
+    logs += glob.glob(f"/var/lib/dkms/{DKMS_NAME}/{DKMS_VERSION}/{KVER}/*/log/make.log")
+    return max(logs, key=os.path.getmtime) if logs else None
+
+
+def show_log_tail(path, n=25):
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, errors="replace") as f:
+            tail = f.read().splitlines()[-n:]
+    except OSError:
+        return
+    log(f"Last lines of {path}:")
+    for line in tail:
+        log("  " + line)
+
+
+def remove_our_dkms(ver):
+    if which("dkms") and any(v == ver for v, _, _ in dkms_status()):
+        run(["dkms", "remove", "-m", DKMS_NAME, "-v", ver, "--all"])
+    remove_path(src_dir(ver))
+
+
+def install_dkms(clone):
+    dst = src_dir(DKMS_VERSION)
+    if os.path.lexists(dst):
+        if not is_ours(DKMS_VERSION):
+            raise Fail(f"{dst} exists and was not made by this app. Remove it, then try again.")
+        remove_our_dkms(DKMS_VERSION)
+
+    copy_tree(clone, dst)
+    write_file(os.path.join(dst, "dkms.conf"), DKMS_CONF)
+    write_file(os.path.join(dst, MARKER), f"{BUILD_ID}\n")
+
+    base = ["dkms"]
+    mv = ["-m", DKMS_NAME, "-v", DKMS_VERSION]
+    rc, _ = run(base + ["add"] + mv)
+    if rc != 0:
+        raise Fail("dkms add failed. The log above has the details.")
+    log("Building the driver. This takes a minute.")
+    rc, _ = run(base + ["build"] + mv + ["-k", KVER])
+    if rc != 0:
+        show_log_tail(dkms_make_log())
+        remove_our_dkms(DKMS_VERSION)
+        raise Fail("Building the driver failed. The end of the build log is above.")
+    # Older versions go only after the new one built, so a failed build leaves them working.
+    for ver in our_dkms_versions():
+        if ver != DKMS_VERSION:
+            log(f"Removing older driver version {ver}")
+            remove_our_dkms(ver)
+    # A build from the no-DKMS fallback would shadow the DKMS one.
+    remove_path(plain_dir())
+    rc, _ = run(base + ["install"] + mv + ["-k", KVER])
+    if rc != 0:
+        raise Fail("dkms install failed. The log above has the details.")
+
+
+def install_plain(clone):
+    if not DRY and not os.path.isdir(build_dir()):
+        raise Fail(f"Headers for kernel {KVER} are missing. Run the build tools step first.")
+    cmd = ["make", f"-j{os.cpu_count() or 2}", f"KDIR={build_dir()}"]
+    if kernel_is_clang():
+        cmd.append("LLVM=1")
+    make_log = os.path.join(WORK_DIR, "make.log")
+    log("Building the driver. This takes a minute.")
+    rc, _ = run(cmd, cwd=clone, log_path=None if DRY else make_log, quiet=True)
+    if rc != 0:
+        show_log_tail(make_log)
+        raise Fail("Building the driver failed. The end of the build log is above.")
+    kos = [os.path.join(clone, "hid-tmff-new.ko"),
+           os.path.join(clone, "deps/hid-tminit/hid-tminit-new.ko"),
+           os.path.join(clone, "deps/hid-tminit/usb-tminit-new.ko")]
+    if not DRY:
+        for ko in kos:
+            if not os.path.exists(ko):
+                raise Fail(f"The build did not produce {os.path.basename(ko)}.")
+    dest = plain_dir()
+    remove_path(dest)
+    if DRY:
+        dry(f"create {dest}")
+    else:
+        os.makedirs(dest, 0o755)
+    for ko in kos:
+        if DRY:
+            dry(f"copy {ko} to {dest}/")
+        else:
+            shutil.copy2(ko, dest)
+            os.chmod(os.path.join(dest, os.path.basename(ko)), 0o644)
+    write_file(os.path.join(dest, MARKER), f"{BUILD_ID}\n")
+    rc, _ = run(["depmod", "-a", KVER])
+    if rc != 0:
+        raise Fail("depmod failed. The log above has the details.")
+    log("Built without DKMS: run setup again after each kernel update.")
+
+
+def do_driver():
+    global DRY_NEW_DRIVER
+    if check_immutable_for_install():
+        return "skipped", "The driver is already part of your system."
+    other = foreign_driver()
+    if other:
+        log(f"Found hid-tmff2 from another source: {other}")
+        return "skipped", "hid-tmff2 from another source is already installed. Leaving it alone."
+    dkms = has_dkms()
+    if dkms:
+        for ver, kern, state in dkms_status():
+            if ver == DKMS_VERSION and kern == KVER and state == "installed" and is_ours(ver):
+                remove_path(plain_dir())
+                return "skipped", "The driver is already installed for this kernel."
+    elif read(os.path.join(plain_dir(), MARKER)) == BUILD_ID and \
+            os.path.exists(os.path.join(plain_dir(), "hid-tmff-new.ko")):
+        return "skipped", "The driver is already installed for this kernel."
+
+    old = [v for v in our_dkms_versions() if v != DKMS_VERSION]
+    if os.path.exists(os.path.join(plain_dir(), MARKER)) and \
+            read(os.path.join(plain_dir(), MARKER)) != BUILD_ID:
+        old.append("a build without DKMS")
+    if old:
+        log(f"Updating the driver from {', '.join(old)} to {DKMS_VERSION}.")
+
+    if not which("git") and not DRY:
+        raise Fail("git is missing. Run the build tools step first.")
+    if not DRY and not os.path.isdir(build_dir()):
+        raise Fail(f"Headers for kernel {KVER} are missing. Run the build tools step first.")
+
+    clone = fetch_driver()
+    if dkms:
+        install_dkms(clone)
+    else:
+        log("DKMS is not installed, building the driver directly.")
+        install_plain(clone)
+    if DRY:
+        DRY_NEW_DRIVER = True
+
+    if sig_enforced():
+        if mok_enrolled() is not True:
+            secureboot_hint()
+    return "done", "Driver installed for kernel " + KVER + (" (dry run)" if DRY else "")
+
+
+def rules_text(auto_pc):
+    pids = "|".join((PC_PID,) + PS_PIDS)
+    lines = [
+        "# My Linux T248R Panel. Written by t248r-panel-helper; its uninstall command removes it.",
+        "",
+        "# T248R in PC mode and both PlayStation modes: give the logged-in user access.",
+        f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ATTR{{idVendor}}=="{VENDOR}", '
+        f'ATTR{{idProduct}}=="{pids}", TAG+="uaccess"',
+        f'SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{{idVendor}}=="{VENDOR}", '
+        f'ATTRS{{idProduct}}=="{pids}", TAG+="uaccess"',
+        "",
+        "# TH8A / TH8S shifter over USB.",
+        f'SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{{idVendor}}=="{VENDOR}", '
+        f'ATTRS{{idProduct}}=="b660", TAG+="uaccess"',
+        "",
+        "# USB autosuspend cuts force feedback, so keep the wheel powered.",
+        f'ACTION!="remove", SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ATTR{{idVendor}}=="{VENDOR}", '
+        f'ATTR{{idProduct}}=="{pids}", ATTR{{power/control}}="on"',
+        "",
+        "# Let the panel change range, gain and effect levels once tmff2 drives the wheel.",
+        f'ACTION!="remove", SUBSYSTEM=="hid", KERNEL=="0003:044F:{PC_PID.upper()}.*", '
+        f'DRIVER=="{HID_DRIVER}", RUN+="/bin/sh -c \'cd %S%p && chmod 0666 {" ".join(TUNABLES)}\'"',
+    ]
+    if auto_pc:
+        lines += [
+            "",
+            "# Switch a T248R plugged in while in PlayStation mode to PC mode.",
+            f'ACTION=="add", SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ATTR{{idVendor}}=="{VENDOR}", '
+            f'ATTR{{idProduct}}=="{"|".join(PS_PIDS)}", ATTR{{bcdDevice}}=="{T248R_BCD}", '
+            f'RUN+="{HELPER} switch-to-pc $env{{BUSNUM}} $env{{DEVNUM}}"',
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def udev_reload():
+    run(["udevadm", "control", "--reload"])
+    devs = list(usb_devices())
+    for d in devs:
+        run(["udevadm", "trigger", "--action=change", "--parent-match=" + d])
+    if not devs:
+        run(["udevadm", "trigger", "--action=change", "--subsystem-match=usb",
+             "--attr-match=idVendor=" + VENDOR])
+    run(["udevadm", "settle", "--timeout=5"], quiet=True)
+
+
+def root_only_writable(path):
+    """True if no one but root can change the file or any folder above it."""
+    path = os.path.realpath(path)
+    while True:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            return False
+        parent = os.path.dirname(path)
+        if parent == path:
+            return True
+        path = parent
+
+
+def do_rules(auto_pc):
+    if auto_pc and not re.fullmatch(r"/[A-Za-z0-9/._+-]+", HELPER):
+        log("The helper's path has characters udev can't handle, so automatic PC mode switching is off.")
+        auto_pc = False
+    # udev would run this file as root on every plug-in, so it must not be user-editable.
+    pkg = os.path.join(os.path.dirname(HELPER), "t248rpanel", "usbctl.py")
+    if auto_pc and not (root_only_writable(HELPER) and root_only_writable(pkg)):
+        log("The helper isn't installed in a system folder, so automatic PC mode switching is off.")
+        auto_pc = False
+    write_file(RULES_FILE, rules_text(auto_pc))
+    udev_reload()
+    if auto_pc:
+        for d in wheels_in_ps_mode():
+            log("The wheel is in PlayStation mode. Switching it to PC mode.")
+            try:
+                switch_device(d)
+            except Fail as e:
+                log(str(e))
+    note = "" if auto_pc else " Automatic PC mode switching is off."
+    return "done", "Device rules are in place." + note + (" (dry run)" if DRY else "")
+
+
+# ---------------------------------------------------------------- options
+
+def parse_options_file(path=OPTIONS_FILE):
+    vals = {}
+    text = read(path)
+    if text is None:
+        return None
+    for line in text.splitlines():
+        parts = line.split("#", 1)[0].split()
+        if len(parts) < 2 or parts[0] != "options" or parts[1].replace("_", "-") != MODULE:
+            continue
+        for tok in parts[2:]:
+            k, sep, v = tok.partition("=")
+            if sep and k in OPTION_RANGES and re.fullmatch(r"[0-9]{1,5}", v):
+                lo, hi = OPTION_RANGES[k]
+                if lo <= int(v) <= hi:
+                    vals[k] = int(v)
+    return vals
+
+
+def options_text(vals):
+    body = " ".join(f"{k}={vals[k]}" for k in OPTION_RANGES if k in vals)
+    return ("# My Linux T248R Panel. Driver defaults for hid-tmff2, read when the driver loads.\n"
+            f"options {MODULE} {body}\n")
+
+
+def note_other_option_files():
+    for f in sorted(glob.glob("/etc/modprobe.d/*.conf")):
+        if f == OPTIONS_FILE:
+            continue
+        text = read(f, "")
+        if re.search(r"^\s*options\s+hid[-_]tmff[-_]new\b", text, re.M):
+            log(f"Note: {f} also sets options for this driver.")
+
+
+def do_options_setup():
+    if os.path.exists(OPTIONS_FILE):
+        known = parse_options_file() or {}
+        words = " ".join(l.split("#", 1)[0] for l in read(OPTIONS_FILE, "").splitlines()).split()
+        stale = [w.split("=", 1)[0] for w in words if "=" in w and w.split("=", 1)[0] not in OPTION_RANGES]
+        if not stale:
+            return "skipped", "Keeping your saved driver settings."
+        write_file(OPTIONS_FILE, options_text({**OPTION_DEFAULTS, **known}))
+        return "done", f"Kept your settings and removed ones the driver no longer uses ({', '.join(stale)})."
+    write_file(OPTIONS_FILE, options_text(OPTION_DEFAULTS))
+    note_other_option_files()
+    return "done", "Saved default driver settings." + (" (dry run)" if DRY else "")
+
+
+def apply_live(given):
+    if not os.path.isdir(MODULE_SYS):
+        return
+    for k in MODULE_PARAMS:
+        if k in given:
+            p = f"{MODULE_SYS}/parameters/{k}"
+            if not os.path.exists(p):
+                log(f"The loaded driver is too old for {k}. Run setup to update it.")
+                continue
+            try:
+                write_sysfs(p, given[k])
+                log(f"Set {k} to {given[k]} now.")
+            except OSError as e:
+                log(f"Could not set {k} now: {e.strerror}")
+    for hid in pc_hid_devices():
+        if driver_of(hid) != HID_DRIVER:
+            continue
+        for k in TUNABLES:
+            p = f"{hid}/{k}"
+            if k in given and os.path.exists(p):
+                try:
+                    write_sysfs(p, given[k])
+                    log(f"Set {k} to {given[k]} on the wheel now.")
+                except OSError as e:
+                    log(f"Could not set {k} on the wheel now: {e.strerror}")
+
+
+def do_write_options(given):
+    vals = parse_options_file()
+    if vals is None:
+        vals = dict(OPTION_DEFAULTS)
+    vals.update(given)
+    write_file(OPTIONS_FILE, options_text(vals))
+    note_other_option_files()
+    apply_live(given)
+    return "done", "Driver settings saved." + (" (dry run)" if DRY else "")
+
+
+# ---------------------------------------------------------------- activate
+
+def loaded_is_stale():
+    """True when the loaded driver is an older build of ours than the one on disk."""
+    if not os.path.isdir(MODULE_SYS) or not module_path() or foreign_driver():
+        return False
+    if DRY and DRY_NEW_DRIVER:
+        return True
+    live = read(f"{MODULE_SYS}/srcversion")
+    _, disk = query(["modinfo", "-k", KVER, "-F", "srcversion", MODULE])
+    if live and disk.strip():
+        return live != disk.strip()
+    # The old patched build had an extra parameter; seeing it loaded means a reload is due.
+    return os.path.exists(f"{MODULE_SYS}/parameters/plain_encoders")
+
+
+def do_activate():
+    if not module_path() and not os.path.isdir(MODULE_SYS):
+        if not DRY:
+            raise Fail("The driver is not installed yet.")
+        dry("the driver is not installed here; continuing as if it were")
+    reload = loaded_is_stale()
+    if reload:
+        log("The loaded driver is an older version. Reloading it.")
+        rc, _ = run(["rmmod", "hid_tmff_new"])
+        if rc != 0:
+            hint("reboot", "The old driver is still in use. Restart your computer to load the new one.")
+            return "done", "Force feedback works, but the new driver loads after a restart."
+        if not DRY:
+            wait_for(lambda: not os.path.isdir(MODULE_SYS), 3)
+    if reload or not os.path.isdir(MODULE_SYS):
+        rc, lines = run(["modprobe", MODULE])
+        if rc != 0:
+            text = "\n".join(lines).lower()
+            if "key was rejected" in text or "required key not available" in text:
+                secureboot_hint()
+                raise Fail("The kernel refused the driver because it is not signed with a trusted key.")
+            if "exec format error" in text or "invalid module format" in text:
+                hint("reboot", "The driver was built for a different kernel. Restart your computer, "
+                     "then run setup again.")
+                raise Fail("The driver doesn't match the running kernel.")
+            raise Fail("Loading the driver failed. The log above has the details.")
+    if not DRY and not wait_for(lambda: os.path.isdir(f"/sys/bus/hid/drivers/{HID_DRIVER}"), 3):
+        raise Fail("The driver loaded but did not register with the HID system.")
+
+    if not pc_hid_devices() and wheels_in_ps_mode() and not DRY:
+        log("Waiting for the wheel to come back in PC mode...")
+        wait_for(lambda: bool(pc_hid_devices()), 8)
+    devs = pc_hid_devices()
+    if not devs:
+        if wheels_in_ps_mode():
+            return "skipped", "Driver loaded. The wheel is in PlayStation mode; switch it to PC mode."
+        return "skipped", "Driver loaded. Plug in the wheel to use it."
+
+    # The HID core usually moves the wheel to tmff2 by itself right after modprobe.
+    if not DRY:
+        wait_for(lambda: all(driver_of(d) == HID_DRIVER for d in devs), 1.5)
+    for d in devs:
+        name = os.path.basename(d)
+        drv = driver_of(d)
+        if drv == HID_DRIVER:
+            continue
+        if drv not in (None, "hid-generic"):
+            raise Fail(f"The wheel is used by another driver ({drv}). Unplug it and plug it back in.")
+        log(f"Moving {name} from {drv or 'no driver'} to {HID_DRIVER}")
+        try:
+            if drv:
+                write_sysfs(f"/sys/bus/hid/drivers/{drv}/unbind", name)
+            write_sysfs(f"/sys/bus/hid/drivers/{HID_DRIVER}/bind", name)
+        except OSError as e:
+            log(f"Rebinding {name} failed: {e.strerror}")
+    if DRY:
+        return "done", "Force feedback would be ready (dry run)."
+    wait_for(lambda: all(driver_of(d) == HID_DRIVER for d in pc_hid_devices()), 2)
+    left = [d for d in pc_hid_devices() if driver_of(d) != HID_DRIVER]
+    if left:
+        raise Fail(f"The wheel is still on {driver_of(left[0]) or 'no driver'}. "
+                   "Unplug it and plug it back in.")
+    return "done", "Force feedback is ready."
+
+
+# ---------------------------------------------------------------- switch to PC mode
+
+def switch_device(d):
+    """Send the PC mode command to a validated sysfs USB device dir."""
+    pid = read(f"{d}/idProduct")
+    if read(f"{d}/idVendor") != VENDOR or read(f"{d}/bcdDevice") != T248R_BCD:
+        raise Fail("That device is not a T248R.")
+    if pid == PC_PID:
+        return "skipped", "The wheel is already in PC mode."
+    if pid not in PS_PIDS:
+        raise Fail("That device is not a T248R.")
+    bus, dev = int(read(f"{d}/busnum")), int(read(f"{d}/devnum"))
+    node = f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+    if DRY:
+        dry(f"send control transfer 0x41/0x53 wValue 0x000b to {node}")
+        return "done", "Switch command would be sent (dry run)."
+    usbctl = _usbctl()
+    try:
+        usbctl.switch_to_pc_mode(usbctl.node_path(bus, dev))
+    except OSError as e:
+        # The wheel may drop off the bus before it acknowledges the request.
+        if e.errno not in (errno.ENODEV, errno.ESHUTDOWN, errno.EPROTO, errno.EPIPE):
+            raise Fail(f"Sending the switch command failed: {e.strerror}")
+    return "done", "Switch command sent. The wheel reconnects in PC mode."
+
+
+def _usbctl():
+    here = os.path.dirname(HELPER)
+    for base in (here, os.path.dirname(here)):
+        if os.path.exists(os.path.join(base, "t248rpanel", "usbctl.py")):
+            if base not in sys.path:
+                sys.path.insert(0, base)
+            break
+    else:
+        raise Fail("Could not find the t248rpanel package next to the helper.")
+    from t248rpanel import usbctl
+    return usbctl
+
+
+def do_switch(bus, dev):
+    for d in glob.glob("/sys/bus/usb/devices/*"):
+        b, n = read(f"{d}/busnum"), read(f"{d}/devnum")
+        if b and n and b.isdigit() and n.isdigit() and int(b) == bus and int(n) == dev:
+            return switch_device(d)
+    raise Fail(f"No USB device at bus {bus} device {dev}.")
+
+
+# ---------------------------------------------------------------- uninstall
+
+def do_uninstall():
+    removed = False
+    for ver in our_dkms_versions():
+        log(f"Removing DKMS module {DKMS_NAME} {ver}")
+        remove_our_dkms(ver)
+        removed = True
+    for d in sorted(glob.glob(f"/lib/modules/*/{PLAIN_SUBDIR}")):
+        if not os.path.exists(os.path.join(d, MARKER)):
+            continue
+        kver = d.split("/")[3]
+        log(f"Removing the driver built for kernel {kver}")
+        remove_path(d)
+        if os.path.exists(f"/lib/modules/{kver}/modules.dep"):
+            run(["depmod", "-a", kver])
+        removed = True
+    for f in (RULES_FILE, OPTIONS_FILE):
+        if remove_path(f):
+            log("Removed " + f)
+            removed = True
+    if remove_path(WORK_DIR):
+        removed = True
+
+    if os.path.isdir(MODULE_SYS):
+        if module_path() and not DRY:
+            log("Leaving the hid-tmff2 driver from another source loaded.")
+        else:
+            rc, _ = run(["rmmod", "hid_tmff_new"])
+            if rc != 0:
+                hint("reboot", "The driver is still in use. Restart your computer to unload it.")
+            else:
+                # Give the wheel back to hid-generic so input keeps working.
+                for d in pc_hid_devices():
+                    if not driver_of(d):
+                        try:
+                            write_sysfs("/sys/bus/hid/drivers_probe", os.path.basename(d))
+                        except OSError:
+                            pass
+            removed = True
+    run(["udevadm", "control", "--reload"])
+    if DRY:
+        return "done", "Everything would be removed (dry run)."
+    return "done", "Removed the driver and settings." if removed else "Nothing to remove."
+
+
+# ---------------------------------------------------------------- main
+
+STEP_TITLES = {
+    "tools": "Installing build tools",
+    "driver": "Installing the force feedback driver",
+    "rules": "Writing device rules",
+    "options": "Saving driver settings",
+    "activate": "Loading the driver",
+    "uninstall": "Removing the driver and settings",
+    "switch": "Switching the wheel to PC mode",
+}
+
+
+def run_step(sid, fn, *args):
+    step(sid, "running", STEP_TITLES[sid])
+    try:
+        state, text = fn(*args)
+    except Fail as e:
+        step(sid, "failed", str(e))
+        return False
+    except Exception as e:  # keep the protocol intact on bugs
+        import traceback
+        for line in traceback.format_exc().splitlines():
+            log(line)
+        step(sid, "failed", f"Unexpected error: {e}")
+        return False
+    step(sid, state, text)
+    return True
+
+
+def usage():
+    return f"""Usage: {os.path.basename(HELPER)} [--dry-run] <command> [args]
+
+Commands:
+  setup [--no-auto-pc]          install tools, driver, rules and settings, then load the driver
+  install-tools                 install git, make, gcc, dkms and headers for kernel {KVER}
+  install-driver                download and install hid-tmff2 {DRIVER_COMMIT[:7]} ({DKMS_VERSION})
+  install-rules [--no-auto-pc]  write the udev rules
+  write-options key=value...    save driver settings: {", ".join(OPTION_RANGES)}
+  activate                      load the driver and move the wheel to it
+  switch-to-pc BUSNUM DEVNUM    switch a T248R in PlayStation mode to PC mode
+  uninstall                     remove everything this helper installed
+
+--dry-run prints what would be done without changing anything. It works without root.
+"""
+
+
+def die_usage(msg):
+    sys.stderr.write(msg + "\n\n" + usage())
+    sys.exit(2)
+
+
+def parse_int(text, lo, hi, what):
+    if not re.fullmatch(r"[0-9]{1,5}", text or "") or not lo <= int(text) <= hi:
+        die_usage(f"{what} must be a whole number from {lo} to {hi}.")
+    return int(text)
+
+
+def parse_options_args(args):
+    if not args:
+        die_usage("write-options needs at least one key=value.")
+    given = {}
+    for a in args:
+        k, sep, v = a.partition("=")
+        if not sep or k not in OPTION_RANGES:
+            die_usage(f"Unknown setting '{a}'. Allowed: {', '.join(OPTION_RANGES)}.")
+        if k in given:
+            die_usage(f"{k} is given twice.")
+        lo, hi = OPTION_RANGES[k]
+        given[k] = parse_int(v, lo, hi, k)
+    return given
+
+
+def main(argv):
+    global DRY
+    os.umask(0o022)
+    args = [a for a in argv if a != "--dry-run"]
+    DRY = len(args) != len(argv)
+    if not args or args[0] in ("-h", "--help", "help"):
+        sys.stdout.write(usage())
+        return 0 if args else 2
+    cmd, rest = args[0], args[1:]
+
+    def flag_no_auto_pc():
+        if rest not in ([], ["--no-auto-pc"]):
+            die_usage(f"{cmd} only takes --no-auto-pc.")
+        return not rest
+
+    def no_args():
+        if rest:
+            die_usage(f"{cmd} takes no arguments.")
+
+    if cmd == "setup":
+        plan = [("tools", do_tools), ("driver", do_driver), ("rules", lambda: do_rules(auto)),
+                ("options", do_options_setup), ("activate", do_activate)]
+        auto = flag_no_auto_pc()
+    elif cmd == "install-tools":
+        no_args(); plan = [("tools", do_tools)]
+    elif cmd == "install-driver":
+        no_args(); plan = [("driver", do_driver)]
+    elif cmd == "install-rules":
+        auto = flag_no_auto_pc(); plan = [("rules", lambda: do_rules(auto))]
+    elif cmd == "write-options":
+        given = parse_options_args(rest); plan = [("options", lambda: do_write_options(given))]
+    elif cmd == "activate":
+        no_args(); plan = [("activate", do_activate)]
+    elif cmd == "switch-to-pc":
+        if len(rest) != 2:
+            die_usage("switch-to-pc needs BUSNUM and DEVNUM.")
+        bus = parse_int(rest[0], 1, 999, "BUSNUM")
+        dev = parse_int(rest[1], 1, 127, "DEVNUM")
+        plan = [("switch", lambda: do_switch(bus, dev))]
+    elif cmd == "uninstall":
+        no_args(); plan = [("uninstall", do_uninstall)]
+    else:
+        die_usage(f"Unknown command '{cmd}'.")
+
+    if not DRY and os.geteuid() != 0:
+        log("This needs root. Run it through pkexec, or add --dry-run to see what it would do.")
+        return 1
+    if DRY:
+        dry(f"helper {HELPER}, kernel {KVER}, distro family {detect_family()}")
+
+    for sid, fn in plan:
+        if not run_step(sid, fn):
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

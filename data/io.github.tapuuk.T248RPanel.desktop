@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=My Linux T248R Panel
+GenericName=Racing Wheel Settings
+Comment=Set up, test and tune your Thrustmaster T248R racing wheel
+Exec=my-linux-t248r-panel
+Icon=io.github.tapuuk.T248RPanel
+Terminal=false
+StartupNotify=true
+Categories=Settings;HardwareSettings;Game;
+Keywords=Thrustmaster;T248R;T248;racing wheel;steering wheel;wheel;force feedback;FFB;pedals;shifter;TH8A;TH8S;sim racing;driver;hid-tmff2;joystick;

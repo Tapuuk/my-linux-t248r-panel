@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3f4b"/>
+      <stop offset="1" stop-color="#1f2229"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4f5f8"/>
+      <stop offset="1" stop-color="#cfd3dc"/>
+    </linearGradient>
+  </defs>
+
+  <!-- squircle tile -->
+  <path d="M64 4C110 4 124 18 124 64S110 124 64 124 4 110 4 64 18 4 64 4Z" fill="url(#tile)"/>
+
+  <!-- rim -->
+  <circle cx="64" cy="66" r="40" fill="none" stroke="url(#rim)" stroke-width="14"/>
+
+  <!-- spokes and hub -->
+  <g fill="url(#rim)">
+    <rect x="28" y="58" width="72" height="14" rx="7"/>
+    <rect x="56" y="64" width="16" height="38" rx="6"/>
+    <rect x="42" y="50" width="44" height="32" rx="14"/>
+  </g>
+
+  <!-- hub screen -->
+  <rect x="53" y="59" width="22" height="12" rx="4" fill="#2b2f38"/>
+
+  <!-- top centre stripe, as on the T248R rim -->
+  <rect x="57" y="18" width="14" height="16" rx="5" fill="#e8372f"/>
+</svg>

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm --needed git make python pyside6 python-evdev qt6-declarative desktop-file-utils appstream
+      - uses: actions/checkout@v4
+      - name: Byte-compile the Python code
+        run: |
+          export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache"
+          python3 -m py_compile launcher.py helper/t248r-panel-helper $(find t248rpanel -name '*.py')
+      - name: qmllint
+        run: |
+          find t248rpanel/qml -name '*.qml' -print0 \
+            | xargs -0 -r /usr/lib/qt6/bin/qmllint --unqualified disable
+      - name: Desktop file and metainfo
+        run: |
+          desktop-file-validate data/io.github.tapuuk.T248RPanel.desktop
+          appstreamcli validate --no-net data/io.github.tapuuk.T248RPanel.metainfo.xml
+      - name: Install layout
+        run: |
+          make install DESTDIR="$RUNNER_TEMP/root"
+          test -x "$RUNNER_TEMP/root/usr/lib/my-linux-t248r-panel/t248r-panel-helper"
+          test -z "$(find "$RUNNER_TEMP/root" -name __pycache__)"
+          T248R_PANEL_DRY_RUN=1 python3 "$RUNNER_TEMP/root/usr/lib/my-linux-t248r-panel/launcher.py"

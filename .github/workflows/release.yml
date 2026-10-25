@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Manual runs build and test-install everything but publish nothing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag, code and packaging agree on the version
+        run: |
+          v=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' t248rpanel/__init__.py)
+          echo "code $v, ref $GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then test "v$v" = "$GITHUB_REF_NAME"; fi
+          grep -qx "pkgver=$v" packaging/arch/PKGBUILD
+          grep -qE "^Version:[[:space:]]+$v\$" packaging/rpm/my-linux-t248r-panel.spec
+          grep -q "<release version=\"$v\"" data/io.github.tapuuk.T248RPanel.metainfo.xml
+
+  arch:
+    needs: version
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm --needed git make python pyside6 python-evdev polkit
+      - uses: actions/checkout@v4
+      - name: Build (makepkg refuses to run as root)
+        run: |
+          useradd -m builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE' && make arch"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: |
+            dist/*.pkg.tar.zst
+            dist/*.tar.gz
+
+  deb:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb
+
+  rpm:
+    needs: version
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - run: dnf install -y rpm-build make tar gzip desktop-file-utils
+      - uses: actions/checkout@v4
+      - run: make rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/noarch/*.rpm
+
+  # Installs each package on the distros it targets and checks which Python the launcher picks.
+  install-test:
+    needs: [arch, deb, rpm]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {image: 'archlinux:latest', kind: arch, expect: system}
+          - {image: 'debian:13', kind: deb, expect: system}
+          - {image: 'debian:12', kind: deb, expect: venv}
+          - {image: 'ubuntu:24.04', kind: deb, expect: venv}
+          - {image: 'ubuntu:latest', kind: deb, expect: system}
+          - {image: 'fedora:latest', kind: rpm, expect: system}
+          - {image: 'registry.opensuse.org/opensuse/tumbleweed:latest', kind: rpm, expect: system}
+          - {image: 'registry.opensuse.org/opensuse/leap:16.0', kind: rpm, expect: system}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.kind }}
+          path: pkg
+      - name: Install
+        run: |
+          set -x
+          case "${{ matrix.kind }}" in
+            arch) pacman -Syu --noconfirm && pacman -U --noconfirm pkg/*.pkg.tar.zst ;;
+            deb)  apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ./pkg/*.deb ;;
+            rpm)  if command -v dnf >/dev/null; then dnf install -y pkg/*.rpm
+                  else zypper --non-interactive install --allow-unsigned-rpm pkg/*.rpm; fi ;;
+          esac
+      - name: Launcher picks the expected Python
+        run: |
+          out=$(T248R_PANEL_DRY_RUN=1 my-linux-t248r-panel)
+          echo "$out"
+          case "${{ matrix.expect }}" in
+            system) echo "$out" | grep -q -- '-m t248rpanel$' ;;
+            venv)   echo "$out" | grep -q '^venv .*would build from' ;;
+          esac
+      - name: Build the PySide6 venv
+        if: matrix.expect == 'venv'
+        run: T248R_PANEL_SETUP_ONLY=1 my-linux-t248r-panel
+      - name: Start the app without a display
+        continue-on-error: true
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
+        run: |
+          set +e
+          timeout 20 my-linux-t248r-panel > app.log 2>&1
+          rc=$?
+          cat app.log
+          # 124 means it was still running when the timeout hit, which is what we want.
+          test $rc -eq 124 && ! grep -q "Could not load the interface" app.log
+
+  release:
+    needs: install-test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l out
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" out/* --clobber
